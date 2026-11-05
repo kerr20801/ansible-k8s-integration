@@ -1,0 +1,84 @@
+---
+# K8s 連接性檢查工具 - 在升級前確認所有節點可達
+# 使用方式：
+#   ansible-playbook -i inventory/all k8s-connectivity-check.yml -e target_nodes=uat_masters
+#   ansible-playbook -i inventory/all k8s-connectivity-check.yml -e target_nodes=prod_workers
+
+- name: "K8s 節點連接性檢查"
+  hosts: "{{ target_nodes | default('all') }}"
+  gather_facts: yes
+  vars:
+    timeout_seconds: 30
+    
+  tasks:
+    - name: 基本連接測試
+      ping:
+      register: ping_result
+      
+    - name: 檢查 SSH 連接
+      shell: echo "SSH connection OK"
+      register: ssh_result
+      
+    - name: 檢查系統資源
+      shell: |
+        echo "CPU: $(nproc) cores"
+        echo "Memory: $(free -h | grep '^Mem:' | awk '{print $2}')"
+        echo "Disk: $(df -h / | tail -1 | awk '{print $4}')"
+        echo "Load: $(uptime | awk -F'load average:' '{print $2}')"
+      register: system_info
+      
+    - name: 檢查 K8s 服務狀態
+      systemd:
+        name: kubelet
+      register: kubelet_status
+      ignore_errors: yes
+      
+    - name: 檢查當前 K8s 版本
+      shell: kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/v//' || echo "not_installed"
+      register: current_version
+      
+    - name: 顯示節點狀態
+      debug:
+        msg: |
+          📊 {{ inventory_hostname }} 節點檢查結果:
+          ================================
+          ✅ 連接狀態: {{ '正常' if ping_result.ping == 'pong' else '異常' }}
+          ✅ SSH 連接: {{ '正常' if ssh_result.rc == 0 else '異常' }}
+          📋 系統資源:
+          {{ system_info.stdout }}
+          🔧 Kubelet 狀態: {{ kubelet_status.status.ActiveState | default('unknown') }}
+          📋 當前版本: {{ current_version.stdout }}
+          
+    - name: 連接性檢查失敗
+      fail:
+        msg: |
+          ❌ {{ inventory_hostname }} 連接性檢查失敗
+          請修復以下問題後重試:
+          - 確認節點網路連通性
+          - 檢查 SSH 服務狀態
+          - 驗證防火牆設定
+      when: ping_result.ping != 'pong' or ssh_result.rc != 0
+
+# 生成檢查報告
+- name: "連接性檢查報告"
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    target_nodes: "{{ target_nodes | default('all') }}"
+    
+  tasks:
+    - name: 統計檢查結果
+      debug:
+        msg: |
+          🏆 連接性檢查完成
+          ===================
+          目標節點: {{ target_nodes }}
+          檢查時間: {{ ansible_date_time.iso8601 }}
+          
+          📋 後續建議:
+          1. 所有節點連接正常，可以進行升級
+          2. 如有異常節點，請先修復再升級
+          3. 建議在升級前再次執行此檢查
+          
+          🔄 下一步執行升級:
+          ansible-playbook k8s-component-manager.yml -e target_nodes={{ target_nodes }} -e target_version=1.32.6

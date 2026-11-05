@@ -1,0 +1,131 @@
+---
+# ================================
+# Kubernetes 全新安裝 Playbook
+# 手動執行，不自動初始化
+# ================================
+
+- name: "K8s 安裝 - 前置檢查"
+  hosts: all
+  gather_facts: yes
+  vars:
+    install_version: "{{ target_version | default(kubernetes_version) }}"
+  tasks:
+    - name: 設定安裝版本
+      set_fact:
+        kubernetes_version: "{{ install_version }}"
+        kubeadm_version: "{{ install_version }}"
+        kubelet_version: "{{ install_version }}"
+        kubectl_version: "{{ install_version }}"
+    - name: 顯示安裝摘要
+      debug:
+        msg: |
+          ============================================
+          Kubernetes 安裝作業
+          ============================================
+          目標版本: {{ target_version | default(kubernetes_version) }}
+          Container Runtime: {{ container_runtime }}
+          Pod Network CIDR: {{ pod_network_cidr }}
+          Service Network CIDR: {{ service_network_cidr }}
+          ============================================
+          Masters: {{ groups['masters'] | join(', ') }}
+          Workers: {{ groups['workers'] | join(', ') }}
+          ============================================
+
+    - name: 確認繼續安裝
+      pause:
+        prompt: "請確認以上設定正確，按 Enter 繼續安裝，或 Ctrl+C 取消"
+
+# ================================
+# 階段 1: 系統基礎設定
+# ================================
+
+- name: "階段 1 - 系統基礎設定"
+  hosts: all
+  become: yes
+  roles:
+    - common
+
+# ================================
+# 階段 2: Container Runtime
+# ================================
+
+- name: "階段 2 - Container Runtime 安裝"
+  hosts: all
+  become: yes
+  roles:
+    - docker
+
+# ================================
+# 階段 3: Kubernetes 基礎安裝
+# ================================
+
+- name: "階段 3 - Kubernetes 基礎安裝"
+  hosts: all
+  become: yes
+  roles:
+    - kubernetes
+
+# ================================
+# 階段 4: Master 節點設定
+# ================================
+
+- name: "階段 4 - Master 節點初始化"
+  hosts: masters
+  become: yes
+  serial: 1  # 一次一個 Master
+  roles:
+    - master
+
+# ================================
+# 階段 5: Worker 節點加入
+# ================================
+
+- name: "階段 5 - Worker 節點加入"
+  hosts: workers
+  become: yes
+  roles:
+    - worker
+
+# ================================
+# 階段 6: 安裝後驗證
+# ================================
+
+- name: "階段 6 - 安裝驗證"
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: 等待所有節點就緒
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        kubeconfig: /etc/kubernetes/admin.conf
+      register: nodes_info
+      until: nodes_info.resources | selectattr('status.conditions', 'selectattr', 'type', 'equalto', 'Ready') | selectattr('status.conditions', 'selectattr', 'status', 'equalto', 'True') | list | length == (groups['masters'] | length + groups['workers'] | length)
+      retries: 30
+      delay: 10
+
+    - name: 顯示集群狀態
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        kubeconfig: /etc/kubernetes/admin.conf
+      register: cluster_nodes
+
+    - name: 安裝完成摘要
+      debug:
+        msg: |
+          ============================================
+          Kubernetes 安裝完成！
+          ============================================
+          集群名稱: {{ cluster_name }}
+          版本: {{ target_version | default(kubernetes_version) }}
+          節點總數: {{ cluster_nodes.resources | length }}
+          Masters: {{ groups['masters'] | length }}
+          Workers: {{ groups['workers'] | length }}
+          ============================================
+          
+          下一步操作：
+          1. 複製 kubeconfig: scp root@{{ inventory_hostname }}:/etc/kubernetes/admin.conf ~/.kube/config
+          2. 測試連線: kubectl get nodes
+          3. 安裝網路插件 (如果尚未安裝)
+          ============================================

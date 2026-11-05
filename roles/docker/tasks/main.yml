@@ -1,0 +1,119 @@
+---
+# ================================
+# Container Runtime (containerd) 安裝
+# ================================
+
+- name: Container Runtime 安裝開始
+  debug:
+    msg: "開始安裝 {{ container_runtime }} - {{ inventory_hostname }}"
+
+# ================================
+# containerd 安裝 (Ubuntu/Debian)
+# ================================
+
+- name: 新增 Docker GPG 金鑰 (Ubuntu/Debian)
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 新增 Docker 套件庫 (Ubuntu/Debian)
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 安裝 containerd (Ubuntu/Debian)
+  package:
+    name: containerd.io
+    state: present
+    update_cache: yes
+  become: yes
+  when: ansible_os_family == "Debian"
+
+# ================================
+# containerd 安裝 (RHEL系)
+# ================================
+
+- name: 新增 Docker 套件庫 (RHEL系)
+  yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/centos/7/$basearch/stable
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+- name: 安裝 containerd (RHEL系)
+  package:
+    name: containerd.io
+    state: present
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+# ================================
+# containerd 設定
+# ================================
+
+- name: 建立 containerd 設定目錄
+  file:
+    path: "{{ containerd_config_dir }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: 產生 containerd 預設設定
+  shell: containerd config default > {{ containerd_config_dir }}/config.toml
+  become: yes
+  args:
+    creates: "{{ containerd_config_dir }}/config.toml"
+
+- name: 設定 containerd 使用 systemd cgroup driver
+  replace:
+    path: "{{ containerd_config_dir }}/config.toml"
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  become: yes
+  when: systemd_cgroup | default(true)
+
+# ================================
+# containerd 服務管理
+# ================================
+
+- name: 啟動並啟用 containerd 服務
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+- name: 檢查 containerd 服務狀態
+  systemd:
+    name: containerd
+  become: yes
+  register: containerd_status
+
+- name: 顯示 containerd 狀態
+  debug:
+    msg: "containerd 服務狀態: {{ containerd_status.status.ActiveState }}"
+
+# ================================
+# 清理舊的 Docker (如果存在)
+# ================================
+
+- name: 停用舊的 Docker 服務
+  systemd:
+    name: docker
+    state: stopped
+    enabled: no
+  become: yes
+  failed_when: false
+
+- name: Container Runtime 安裝完成
+  debug:
+    msg: "{{ container_runtime }} 安裝設定完成 - {{ inventory_hostname }}"

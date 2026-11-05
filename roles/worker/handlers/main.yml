@@ -1,0 +1,11 @@
+---
+# ================================
+# Worker Role Handlers  
+# ================================
+
+- name: restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+    daemon_reload: yes
+  become: yes

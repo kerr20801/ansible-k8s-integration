@@ -1,0 +1,252 @@
+---
+# ================================
+# Worker 節點升級劇本
+# 逐一升級所有 Worker 節點
+# ================================
+
+- name: "Upgrade Kubernetes Worker Nodes"
+  hosts: workers
+  become: yes
+  serial: 1  # 一次升級一個 Worker
+  
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    major_minor: "{{ target_version.split('.')[:2] | join('.') }}"
+    master_node: "{{ groups['masters'][0] }}"
+    environment: "{{ environment | default('production') }}"
+    
+  tasks:
+    - name: Get current version
+      shell: kubelet --version | awk '{print $2}' | sed 's/v//' 2>/dev/null || echo "unknown"
+      register: current_version
+      
+    - name: Skip if already upgraded
+      meta: end_host
+      when: current_version.stdout == target_version
+      
+    - name: Display upgrade info
+      debug:
+        msg: |
+          開始升級 Worker: {{ inventory_hostname }}
+          從版本: {{ current_version.stdout }}
+          到版本: {{ target_version }}
+          Master 節點: {{ master_node }}
+          
+    - name: Check node schedulability
+      shell: kubectl get node {{ ansible_hostname }} -o jsonpath='{.spec.unschedulable}' 2>/dev/null || echo "false"
+      delegate_to: "{{ master_node }}"
+      register: node_schedulable_status
+      
+    - name: Worker Upgrade Block
+      block:
+        - name: Update K8S repository
+          shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ major_minor }}/deb/Release.key | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.asc > /dev/null
+            echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ major_minor }}/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+            
+        - name: Update package cache
+          apt:
+            update_cache: yes
+            
+        - name: Unhold K8S packages
+          shell: apt-mark unhold kubeadm kubelet kubectl
+          
+        - name: Drain worker node from master
+          shell: kubectl drain {{ ansible_hostname }} --ignore-daemonsets --delete-emptydir-data --force --timeout={{ safety_settings.drain_timeout }}s
+          delegate_to: "{{ master_node }}"
+          register: drain_result
+          when: safety_settings.enable_node_drain
+          
+        - name: Display drained pods
+          debug:
+            msg: |
+              已排空節點 {{ ansible_hostname }}:
+              {{ drain_result.stdout_lines | join('\n') if drain_result.stdout_lines is defined else '無輸出' }}
+          when: 
+            - safety_settings.enable_node_drain
+            - drain_result is defined
+            
+        - name: Upgrade kubeadm
+          apt:
+            name: "kubeadm={{ target_version }}-1.1"
+            state: present
+            force: yes
+            
+        - name: Upgrade worker node configuration
+          shell: kubeadm upgrade node
+          timeout: 300
+          register: worker_upgrade_result
+          
+        - name: Display upgrade output
+          debug:
+            msg: |
+              Worker 升級輸出:
+              {{ worker_upgrade_result.stdout_lines | join('\n') if worker_upgrade_result.stdout_lines is defined else '無輸出' }}
+              
+        - name: Upgrade kubelet and kubectl
+          apt:
+            name: 
+              - "kubelet={{ target_version }}-1.1"
+              - "kubectl={{ target_version }}-1.1"
+            state: present
+            force: yes
+            
+        - name: Restart kubelet
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+            
+        - name: Hold K8S packages
+          shell: apt-mark hold kubeadm kubelet kubectl
+          when: packages.hold_packages
+          
+        - name: Wait for kubelet to be ready
+          wait_for:
+            port: 10250
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 300
+            
+        - name: Uncordon worker node
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ master_node }}"
+          register: uncordon_result
+          
+        - name: Display uncordon result
+          debug:
+            msg: "節點恢復調度: {{ uncordon_result.stdout }}"
+            
+        - name: Wait for node to be ready
+          shell: kubectl get node {{ ansible_hostname }} --no-headers | awk '{print $2}'
+          delegate_to: "{{ master_node }}"
+          register: node_ready_check
+          until: node_ready_check.stdout == "Ready"
+          retries: "{{ upgrade_strategy.health_check_retries }}"
+          delay: "{{ upgrade_strategy.health_check_delay }}"
+          
+        - name: Verify node version
+          shell: kubectl get node {{ ansible_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
+          delegate_to: "{{ master_node }}"
+          register: node_version
+          
+        - name: Check pods scheduling back to node
+          shell: kubectl get pods --all-namespaces --field-selector spec.nodeName={{ ansible_hostname }} --no-headers | wc -l
+          delegate_to: "{{ master_node }}"
+          register: pods_on_node
+          
+        - name: Show worker upgrade success
+          debug:
+            msg: |
+              Worker {{ inventory_hostname }} 升級成功!
+              新版本: {{ node_version.stdout }}
+              節點上 Pod 數量: {{ pods_on_node.stdout }}
+              
+      rescue:
+        - name: Worker upgrade failed
+          debug:
+            msg: "Worker {{ inventory_hostname }} 升級失敗"
+            
+        - name: Emergency uncordon on failure
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ master_node }}"
+          ignore_errors: yes
+          
+        - name: Collect failure information
+          shell: |
+            echo "=== Kubelet Status ==="
+            systemctl status kubelet --no-pager -l
+            echo "=== Kubelet Logs ==="
+            journalctl -u kubelet --no-pager -l -n 30
+          register: failure_logs
+          ignore_errors: yes
+          
+        - name: Display failure information
+          debug:
+            msg: |
+              失敗診斷資訊:
+              {{ failure_logs.stdout }}
+          when: failure_logs is defined
+          
+        - fail:
+            msg: "Worker 節點升級失敗，請檢查日誌並手動修復"
+            
+    # Worker 間的暫停檢查
+    - name: Pause between workers
+      pause:
+        prompt: |
+          
+          {{ inventory_hostname }} 升級完成
+          
+          請檢查以下狀態:
+          1. kubectl get nodes
+          2. kubectl get pods --all-namespaces -o wide
+          3. kubectl top nodes (如果有 metrics-server)
+          
+          確認 Pod 正常調度後按 Enter 繼續下一個 Worker，或 Ctrl+C 停止
+      when: inventory_hostname != groups['workers'][-1]
+
+# ================================
+# 所有 Workers 升級完成後的驗證
+# ================================
+
+- name: "Post-Workers Upgrade Verification"
+  hosts: masters[0]
+  become: yes
+  
+  tasks:
+    - name: Final workers check
+      shell: kubectl get nodes --no-headers | grep -v control-plane
+      register: workers_status
+      
+    - name: Check workers versions
+      shell: kubectl get nodes --no-headers | grep -v control-plane | awk '{print $1"\t"$5}'
+      register: workers_versions
+      
+    - name: Verify all workers ready
+      shell: kubectl get nodes --no-headers | grep -v control-plane | grep -v Ready | wc -l
+      register: unready_workers
+      
+    - name: Check total pods distribution
+      shell: |
+        echo "=== Pod 分佈狀況 ==="
+        kubectl get pods --all-namespaces -o wide | awk 'NR>1 {print $8}' | sort | uniq -c | sort -nr
+      register: pod_distribution
+      
+    - name: Check problematic pods
+      shell: kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers | wc -l
+      register: problematic_pods
+      
+    - name: Display workers upgrade summary
+      debug:
+        msg: |
+          所有 Worker 節點升級完成！
+          
+          Workers 狀態:
+          {{ workers_status.stdout }}
+          
+          Workers 版本:
+          {{ workers_versions.stdout }}
+          
+          Pod 分佈:
+          {{ pod_distribution.stdout }}
+          
+          健康檢查:
+          - 未就緒 Workers: {{ unready_workers.stdout }}
+          - 問題 Pods: {{ problematic_pods.stdout }}
+          
+          {{ '所有 Workers 健康，升級完成!' if unready_workers.stdout == '0' and problematic_pods.stdout == '0' else '有節點或 Pod 問題，請檢查' }}
+          
+          下一步執行:
+          ansible-playbook -i inventory/hosts.yml playbooks/04-post-upgrade-verify.yml -e target_version={{ target_version }}
+          
+    - name: Warning if issues found
+      debug:
+        msg: |
+          發現問題需要處理:
+          - 未就緒 Workers: {{ unready_workers.stdout }}
+          - 問題 Pods: {{ problematic_pods.stdout }}
+          
+          建議檢查:
+          kubectl get nodes
+          kubectl get pods --all-namespaces | grep -v Running
+      when: unready_workers.stdout != '0' or problematic_pods.stdout != '0'

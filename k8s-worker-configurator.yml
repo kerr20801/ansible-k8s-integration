@@ -1,0 +1,329 @@
+---
+# K8s Worker 角色配置器 - 負責配置 Worker 節點角色
+# 使用方式：
+#   ansible-playbook -i inventory/all k8s-worker-configurator.yml -e target_workers=uat_workers -e target_version=1.32.6
+#   ansible-playbook -i inventory/all k8s-worker-configurator.yml -e target_workers=prod_workers -e target_version=1.33.2
+
+- name: "K8s Worker 角色配置"
+  hosts: "{{ target_workers | default('all_workers') }}"
+  become: yes
+  strategy: free  # Workers 可以並行配置
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    version_info: "{{ k8s_versions.supported[target_version] }}"
+    # 自動找到對應的 Master 群組
+    master_group: "{{ target_workers.replace('workers', 'masters') if target_workers is defined else 'all_masters' }}"
+    master_node: "{{ groups[master_group][0] }}"
+    
+  pre_tasks:
+    - name: 驗證參數
+      assert:
+        that:
+          - target_version is defined
+          - target_version in k8s_versions.supported
+          - target_workers is defined
+        fail_msg: |
+          參數錯誤！
+          支援的版本: {{ k8s_versions.supported.keys() | list }}
+          請指定 target_workers 和 target_version
+          
+    - name: 顯示配置資訊
+      debug:
+        msg: |
+          🛠️ Worker 角色配置
+          ==================
+          目標 Workers: {{ target_workers }}
+          目標版本: {{ target_version }} ({{ version_info.description }})
+          Master 節點: {{ master_node }}
+          當前節點: {{ inventory_hostname }}
+          
+  tasks:
+    - name: 檢查 Worker 狀態
+      block:
+        - name: 檢查節點是否已加入集群
+          shell: kubectl get nodes {{ ansible_hostname }} --no-headers 2>/dev/null | awk '{print $2}' || echo "not_found"
+          register: node_status_check
+          delegate_to: "{{ master_node }}"
+          ignore_errors: yes
+          
+        - name: 檢查當前 kubelet 版本
+          shell: kubelet --version | awk '{print $2}' | sed 's/v//'
+          register: current_kubelet_version
+          
+        - name: 檢查 kubeadm 版本
+          shell: kubeadm version --output=short | sed 's/v//'
+          register: current_kubeadm_version
+          
+        - name: 檢查節點調度狀態
+          shell: kubectl get node {{ ansible_hostname }} -o jsonpath='{.spec.unschedulable}' 2>/dev/null || echo "unknown"
+          delegate_to: "{{ master_node }}"
+          register: node_schedulable_status
+          ignore_errors: yes
+          
+        - name: 顯示當前狀態
+          debug:
+            msg: |
+              📊 {{ inventory_hostname }} 狀態:
+              節點狀態: {{ node_status_check.stdout }}
+              kubelet: {{ current_kubelet_version.stdout }}
+              kubeadm: {{ current_kubeadm_version.stdout }}
+              可調度: {{ 'No' if node_schedulable_status.stdout == 'true' else 'Yes' }}
+              
+    - name: 跳過已配置節點
+      meta: end_host
+      when: 
+        - current_kubelet_version.stdout == target_version
+        - node_status_check.stdout == "Ready"
+        
+    - name: 執行 Worker 角色配置
+      block:
+        - name: 備份重要配置
+          block:
+            - name: 建立備份目錄
+              file:
+                path: "{{ backup.path }}"
+                state: directory
+                
+            - name: 備份 Worker 配置
+              copy:
+                src: "{{ item }}"
+                dest: "{{ backup.path }}/"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/kubelet.conf
+                - /var/lib/kubelet/config.yaml
+              ignore_errors: yes
+              
+          when: backup.enabled
+          
+        - name: 排空節點
+          shell: kubectl drain {{ ansible_hostname }} --ignore-daemonsets --delete-emptydir-data --force --timeout={{ safety_settings.drain_timeout }}s
+          delegate_to: "{{ master_node }}"
+          register: drain_result
+          when: safety_settings.enable_node_drain
+          
+        - name: 顯示排空結果
+          debug:
+            msg: |
+              📤 已排空節點 {{ inventory_hostname }}:
+              {{ drain_result.stdout_lines | join('\n') if drain_result.stdout_lines is defined else '無輸出' }}
+          when: 
+            - safety_settings.enable_node_drain
+            - drain_result is defined
+            
+        - name: 執行 Worker 升級配置
+          shell: kubeadm upgrade node
+          timeout: 300  # 5 分鐘
+          register: worker_upgrade_result
+          
+        - name: 顯示升級輸出
+          debug:
+            msg: |
+              📋 {{ inventory_hostname }} Worker 升級輸出:
+              {{ worker_upgrade_result.stdout_lines | join('\n') if worker_upgrade_result.stdout_lines is defined else '無輸出' }}
+              
+        - name: 重啟 kubelet
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+            
+        - name: 等待 kubelet 啟動
+          wait_for:
+            port: 10250
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 60
+            
+        - name: 恢復節點調度
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ master_node }}"
+          register: uncordon_result
+          
+        - name: 顯示恢復調度結果
+          debug:
+            msg: "📥 節點恢復調度: {{ uncordon_result.stdout }}"
+            
+        - name: 等待節點就緒
+          shell: kubectl get node {{ ansible_hostname }} --no-headers | awk '{print $2}'
+          delegate_to: "{{ master_node }}"
+          register: node_ready_check
+          until: node_ready_check.stdout == "Ready"
+          retries: "{{ safety_settings.health_check_retries }}"
+          delay: "{{ safety_settings.health_check_delay }}"
+          
+        - name: 驗證 Worker 版本
+          shell: kubectl get node {{ ansible_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
+          delegate_to: "{{ master_node }}"
+          register: verified_version
+          
+        - name: 檢查 Pod 重新調度
+          shell: kubectl get pods --all-namespaces --field-selector spec.nodeName={{ ansible_hostname }} --no-headers | wc -l
+          delegate_to: "{{ master_node }}"
+          register: pods_on_node
+          
+        - name: 等待 Pod 穩定
+          shell: kubectl get pods --all-namespaces --field-selector spec.nodeName={{ ansible_hostname }} --no-headers | grep -v Running | wc -l
+          delegate_to: "{{ master_node }}"
+          register: unstable_pods
+          until: unstable_pods.stdout == "0"
+          retries: 10
+          delay: 30
+          ignore_errors: yes
+          
+        - name: 顯示配置成功
+          debug:
+            msg: |
+              ✅ {{ inventory_hostname }} Worker 配置成功！
+              新版本: {{ verified_version.stdout }}
+              節點上 Pod 數量: {{ pods_on_node.stdout }}
+              不穩定 Pod: {{ unstable_pods.stdout }}
+              
+      rescue:
+        - name: Worker 配置失敗
+          debug:
+            msg: |
+              ❌ {{ inventory_hostname }} Worker 配置失敗
+              
+        - name: 緊急恢復節點調度
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ master_node }}"
+          ignore_errors: yes
+          
+        - name: 收集失敗資訊
+          shell: |
+            echo "=== Kubelet 狀態 ==="
+            systemctl status kubelet --no-pager -l
+            echo "=== Kubelet 日誌 ==="
+            journalctl -u kubelet --no-pager -l -n 30
+            echo "=== 節點狀態 ==="
+            kubectl describe node {{ ansible_hostname }}
+          register: failure_info
+          ignore_errors: yes
+          
+        - name: 顯示失敗資訊
+          debug:
+            msg: |
+              📋 失敗診斷資訊:
+              {{ failure_info.stdout }}
+              
+        - name: 還原備份 (如果存在)
+          block:
+            - name: 還原 Worker 配置
+              copy:
+                src: "{{ backup.path }}/{{ item | basename }}"
+                dest: "{{ item }}"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/kubelet.conf
+                - /var/lib/kubelet/config.yaml
+              ignore_errors: yes
+              
+            - name: 重啟 kubelet
+              systemd:
+                name: kubelet
+                state: restarted
+              ignore_errors: yes
+              
+          when: backup.enabled
+          
+        - fail:
+            msg: "Worker 配置失敗，請檢查錯誤資訊並手動修復"
+
+# 所有 Workers 配置完成後的驗證
+- name: "Worker 配置完成驗證"
+  hosts: "{{ target_workers | default('all_workers') }}[0]"
+  become: yes
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    version_info: "{{ k8s_versions.supported[target_version] }}"
+    master_group: "{{ target_workers.replace('workers', 'masters') if target_workers is defined else 'all_masters' }}"
+    master_node: "{{ groups[master_group][0] }}"
+    
+  tasks:
+    - name: 最終 Workers 驗證
+      block:
+        - name: 檢查所有 Workers 狀態
+          shell: kubectl get nodes --no-headers | grep -v control-plane
+          delegate_to: "{{ master_node }}"
+          register: workers_status
+          
+        - name: 檢查 Workers 版本
+          shell: kubectl get nodes --no-headers | grep -v control-plane | awk '{print $1"\t"$5}'
+          delegate_to: "{{ master_node }}"
+          register: workers_versions
+          
+        - name: 檢查未就緒 Workers
+          shell: kubectl get nodes --no-headers | grep -v control-plane | grep -v Ready | wc -l
+          delegate_to: "{{ master_node }}"
+          register: unready_workers
+          
+        - name: 檢查 Pod 分佈
+          shell: |
+            echo "=== Pod 分佈狀況 ==="
+            kubectl get pods --all-namespaces -o wide | awk 'NR>1 {print $8}' | sort | uniq -c | sort -nr
+          delegate_to: "{{ master_node }}"
+          register: pod_distribution
+          
+        - name: 檢查問題 Pods
+          shell: kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers | wc -l
+          delegate_to: "{{ master_node }}"
+          register: problematic_pods
+          
+        - name: 檢查集群整體狀態
+          shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+          delegate_to: "{{ master_node }}"
+          register: total_unready_nodes
+          
+        - name: 顯示 Workers 配置總結
+          debug:
+            msg: |
+              🏆 所有 Worker 節點配置完成！
+              ============================
+              
+              📊 Workers 狀態:
+              {{ workers_status.stdout }}
+              
+              📋 Workers 版本:
+              {{ workers_versions.stdout }}
+              
+              📦 Pod 分佈:
+              {{ pod_distribution.stdout }}
+              
+              ✅ 健康檢查:
+              • 未就緒 Workers: {{ unready_workers.stdout }}
+              • 問題 Pods: {{ problematic_pods.stdout }}
+              • 總未就緒節點: {{ total_unready_nodes.stdout }}
+              
+              {{ '🎉 所有 Workers 健康，配置完成!' if unready_workers.stdout == '0' and problematic_pods.stdout == '0' else '⚠️ 有 Workers 問題，請檢查' }}
+              
+              📋 完成狀態:
+              • 目標版本: {{ target_version }} ({{ version_info.description }})
+              • 配置時間: {{ ansible_date_time.iso8601 }}
+              • 支援到期: {{ version_info.support_until }}
+              
+        - name: 後續建議
+          debug:
+            msg: |
+              📋 後續工作建議:
+              1. 持續監控集群穩定性
+              2. 測試關鍵應用功能
+              3. 更新文檔和變更記錄
+              4. 清理備份文件 ({{ backup.path }})
+              
+              🔍 健康檢查命令:
+              kubectl get nodes
+              kubectl get pods --all-namespaces
+              kubectl top nodes
+              
+        - name: 配置失敗警告
+          debug:
+            msg: |
+              ⚠️ 發現問題需要處理:
+              • 未就緒 Workers: {{ unready_workers.stdout }}
+              • 問題 Pods: {{ problematic_pods.stdout }}
+              
+              建議檢查:
+              kubectl get nodes
+              kubectl get pods --all-namespaces | grep -v Running
+              kubectl describe nodes
+          when: unready_workers.stdout != '0' or problematic_pods.stdout != '0'

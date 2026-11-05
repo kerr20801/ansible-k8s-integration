@@ -1,0 +1,191 @@
+---
+# ================================
+# 系統基礎設定 Role
+# ================================
+
+- name: 系統基礎設定開始
+  debug:
+    msg: "開始配置基礎系統設定 - {{ inventory_hostname }}"
+
+# ================================
+# 系統需求檢查
+# ================================
+
+- name: 檢查系統版本
+  fail:
+    msg: "不支援的系統版本: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+  when: 
+    - ansible_distribution not in ['Ubuntu', 'CentOS', 'Rocky', 'AlmaLinux']
+    - ansible_distribution_version is version('18.04', '<') and ansible_distribution == 'Ubuntu'
+    - ansible_distribution_version is version('7', '<') and ansible_distribution in ['CentOS', 'Rocky', 'AlmaLinux']
+
+# ================================
+# 基礎套件安裝
+# ================================
+
+- name: 更新套件管理器快取
+  package:
+    update_cache: yes
+  become: yes
+
+- name: 安裝基礎套件
+  package:
+    name:
+      - curl
+      - wget
+      - vim
+      - htop
+      - net-tools
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - apt-transport-https  # Ubuntu/Debian
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 安裝基礎套件 (RHEL系)
+  package:
+    name:
+      - curl
+      - wget
+      - vim
+      - htop
+      - net-tools
+      - ca-certificates
+      - gnupg
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+    state: present
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+# ================================
+# 系統設定調整
+# ================================
+
+- name: 停用 Swap
+  command: swapoff -a
+  become: yes
+  when: disable_swap | default(true)
+
+- name: 永久停用 Swap
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+    replace: '# \1'
+  become: yes
+  when: disable_swap | default(true)
+
+- name: 設定 IP 轉發
+  sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    state: present
+    reload: yes
+  become: yes
+  when: enable_ip_forward | default(true)
+
+- name: 載入 br_netfilter 模組
+  modprobe:
+    name: br_netfilter
+    state: present
+  become: yes
+
+- name: 永久載入 br_netfilter 模組
+  lineinfile:
+    path: /etc/modules-load.d/k8s.conf
+    line: br_netfilter
+    create: yes
+  become: yes
+
+- name: 設定 bridge netfilter
+  sysctl:
+    name: "{{ item }}"
+    value: '1'
+    state: present
+    reload: yes
+  become: yes
+  loop:
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.bridge.bridge-nf-call-iptables
+
+# ================================
+# 防火牆設定
+# ================================
+
+- name: 停用防火牆 (Ubuntu/Debian)
+  ufw:
+    state: disabled
+  become: yes
+  when: 
+    - ansible_os_family == "Debian"
+    - disable_firewall | default(true)
+
+- name: 停用防火牆 (RHEL系)
+  systemd:
+    name: firewalld
+    state: stopped
+    enabled: no
+  become: yes
+  when: 
+    - ansible_os_family == "RedHat"
+    - disable_firewall | default(true)
+  failed_when: false
+
+# ================================
+# SELinux 設定 (RHEL系)
+# ================================
+
+- name: 設定 SELinux 為 permissive
+  selinux:
+    policy: targeted
+    state: permissive
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+# ================================
+# 時間同步
+# ================================
+
+- name: 安裝 NTP (Ubuntu/Debian)
+  package:
+    name: ntp
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 安裝 chrony (RHEL系)
+  package:
+    name: chrony
+    state: present
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+- name: 啟動時間同步服務
+  systemd:
+    name: "{{ 'ntp' if ansible_os_family == 'Debian' else 'chronyd' }}"
+    state: started
+    enabled: yes
+  become: yes
+
+# ================================
+# 主機名設定
+# ================================
+
+- name: 設定主機名
+  hostname:
+    name: "{{ inventory_hostname }}"
+  become: yes
+
+- name: 更新 /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ ansible_default_ipv4.address }} {{ inventory_hostname }}"
+    state: present
+  become: yes
+
+- name: 基礎系統設定完成
+  debug:
+    msg: "基礎系統設定完成 - {{ inventory_hostname }}"

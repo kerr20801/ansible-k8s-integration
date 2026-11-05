@@ -1,0 +1,90 @@
+---
+# ================================
+# Kubernetes 基礎安裝 Role
+# ================================
+
+- name: Kubernetes 基礎安裝開始
+  debug:
+    msg: "開始安裝 Kubernetes {{ kubernetes_version }} - {{ inventory_hostname }}"
+
+# ================================
+# 新增 Kubernetes 套件庫
+# ================================
+
+- name: 新增 Kubernetes GPG 金鑰 (Ubuntu/Debian)
+  apt_key:
+    url: https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 新增 Kubernetes 套件庫 (Ubuntu/Debian)
+  apt_repository:
+    repo: "deb https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+    state: present
+  become: yes
+  when: ansible_os_family == "Debian"
+
+- name: 新增 Kubernetes 套件庫 (RHEL系)
+  yum_repository:
+    name: kubernetes
+    description: Kubernetes
+    baseurl: https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
+    gpgcheck: yes
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
+    enabled: yes
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+# ================================
+# 安裝 Kubernetes 組件
+# ================================
+
+- name: 安裝 Kubernetes 組件
+  package:
+    name:
+      - "kubelet={{ kubernetes_version }}-*"
+      - "kubeadm={{ kubernetes_version }}-*"
+      - "kubectl={{ kubernetes_version }}-*"
+    state: present
+    allow_downgrade: yes
+  become: yes
+  notify: restart kubelet
+
+- name: 鎖定 Kubernetes 套件版本 (Ubuntu/Debian)
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  become: yes
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+  when: ansible_os_family == "Debian"
+
+- name: 鎖定 Kubernetes 套件版本 (RHEL系)
+  lineinfile:
+    path: /etc/yum.conf
+    line: "exclude=kubelet kubeadm kubectl"
+    state: present
+  become: yes
+  when: ansible_os_family == "RedHat"
+
+# ================================
+# kubelet 服務設定
+# ================================
+
+- name: 啟用 kubelet 服務
+  systemd:
+    name: kubelet
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+- name: Kubernetes 基礎安裝完成
+  debug:
+    msg: "Kubernetes {{ kubernetes_version }} 基礎組件安裝完成 - {{ inventory_hostname }}"
+
+# ================================
+# Handlers
+# ================================

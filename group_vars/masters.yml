@@ -1,0 +1,44 @@
+# ================================
+# Master 節點專用變數
+# ================================
+
+# Master 節點角色
+node_role: master
+node_type: control-plane
+
+# API Server 設定
+apiserver_bind_port: 6443
+apiserver_cert_sans:
+  - "{{ cluster_vip }}"
+  - "kubernetes"
+  - "kubernetes.default"
+  - "kubernetes.default.svc"
+  - "kubernetes.default.svc.cluster.local"
+
+# etcd 設定
+etcd_data_dir: /var/lib/etcd
+etcd_listen_port: 2379
+etcd_peer_port: 2380
+
+# 控制平面組件
+control_plane_components:
+  - kube-apiserver
+  - kube-controller-manager
+  - kube-scheduler
+  - etcd
+
+# Master 節點標籤和污點
+node_labels:
+  - "node-role.kubernetes.io/control-plane="
+  - "environment={{ environment }}"
+
+node_taints:
+  - "node-role.kubernetes.io/control-plane:NoSchedule"
+
+# HA 設定
+enable_ha: "{{ groups['masters'] | length > 1 }}"
+load_balancer_port: 6443
+
+# 憑證設定
+cert_validity_days: 365
+cert_renew_threshold: 30

@@ -1,0 +1,290 @@
+---
+# K8s Master 角色配置器 - 負責配置 Master 節點角色
+# 使用方式：
+#   ansible-playbook -i inventory/all k8s-master-configurator.yml -e target_masters=uat_masters -e target_version=1.32.6
+#   ansible-playbook -i inventory/all k8s-master-configurator.yml -e target_masters=prod_masters -e target_version=1.33.2
+
+- name: "K8s Master 角色配置"
+  hosts: "{{ target_masters | default('all_masters') }}"
+  become: yes
+  serial: 1  # 一次配置一個 Master
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    version_info: "{{ k8s_versions.supported[target_version] }}"
+    
+  pre_tasks:
+    - name: 驗證參數
+      assert:
+        that:
+          - target_version is defined
+          - target_version in k8s_versions.supported
+          - target_masters is defined
+        fail_msg: |
+          參數錯誤！
+          支援的版本: {{ k8s_versions.supported.keys() | list }}
+          請指定 target_masters 和 target_version
+          
+    - name: 顯示配置資訊
+      debug:
+        msg: |
+          🎛️ Master 角色配置
+          ==================
+          目標 Masters: {{ target_masters }}
+          目標版本: {{ target_version }} ({{ version_info.description }})
+          當前節點: {{ inventory_hostname }}
+          
+  tasks:
+    - name: 檢查 Master 狀態
+      block:
+        - name: 檢查節點是否為 Master
+          shell: kubectl get nodes {{ ansible_hostname }} -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "not_master"
+          register: node_role_check
+          delegate_to: "{{ groups[target_masters][0] }}"
+          ignore_errors: yes
+          
+        - name: 檢查當前 kubelet 版本
+          shell: kubelet --version | awk '{print $2}' | sed 's/v//'
+          register: current_kubelet_version
+          
+        - name: 檢查 kubeadm 版本
+          shell: kubeadm version --output=short | sed 's/v//'
+          register: current_kubeadm_version
+          
+        - name: 顯示當前狀態
+          debug:
+            msg: |
+              📊 {{ inventory_hostname }} 狀態:
+              節點角色: {{ 'Master' if node_role_check.stdout != 'not_master' else '未知' }}
+              kubelet: {{ current_kubelet_version.stdout }}
+              kubeadm: {{ current_kubeadm_version.stdout }}
+              
+    - name: 跳過已配置節點
+      meta: end_host
+      when: 
+        - current_kubelet_version.stdout == target_version
+        - node_role_check.stdout != "not_master"
+        
+    - name: 執行 Master 角色配置
+      block:
+        - name: 檢查是否為第一個 Master
+          set_fact:
+            is_first_master: "{{ inventory_hostname == groups[target_masters][0] }}"
+            
+        - name: 備份重要配置
+          block:
+            - name: 建立備份目錄
+              file:
+                path: "{{ backup.path }}"
+                state: directory
+                
+            - name: 備份 K8s 配置
+              copy:
+                src: "{{ item }}"
+                dest: "{{ backup.path }}/"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/admin.conf
+                - /etc/kubernetes/controller-manager.conf
+                - /etc/kubernetes/scheduler.conf
+              ignore_errors: yes
+              
+          when: backup.enabled
+          
+        - name: 排空節點 (如果需要)
+          shell: kubectl drain {{ ansible_hostname }} --ignore-daemonsets --delete-emptydir-data --force --timeout={{ safety_settings.drain_timeout }}s
+          delegate_to: "{{ groups[target_masters][0] }}"
+          when: 
+            - safety_settings.enable_node_drain
+            - not is_first_master
+          ignore_errors: yes
+          
+        - name: 執行 Master 升級配置
+          block:
+            - name: 第一個 Master - kubeadm upgrade apply
+              shell: kubeadm upgrade apply v{{ target_version }} -y
+              when: is_first_master
+              timeout: 900  # 15 分鐘
+              register: first_master_upgrade
+              
+            - name: 其他 Master - kubeadm upgrade node
+              shell: kubeadm upgrade node
+              when: not is_first_master
+              timeout: 300  # 5 分鐘
+              register: other_master_upgrade
+              
+            - name: 顯示升級輸出
+              debug:
+                msg: |
+                  📋 {{ inventory_hostname }} 升級輸出:
+                  {{ first_master_upgrade.stdout if is_first_master else other_master_upgrade.stdout }}
+                  
+        - name: 重啟 kubelet
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+            
+        - name: 等待 kubelet 就緒
+          wait_for:
+            port: 10250
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 60
+            
+        - name: 恢復節點調度
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ groups[target_masters][0] }}"
+          ignore_errors: yes
+          
+        - name: 等待節點就緒
+          shell: kubectl get node {{ ansible_hostname }} --no-headers | awk '{print $2}'
+          delegate_to: "{{ groups[target_masters][0] }}"
+          register: node_ready_check
+          until: node_ready_check.stdout == "Ready"
+          retries: "{{ safety_settings.health_check_retries }}"
+          delay: "{{ safety_settings.health_check_delay }}"
+          
+        - name: 驗證 Master 版本
+          shell: kubectl get node {{ ansible_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
+          delegate_to: "{{ groups[target_masters][0] }}"
+          register: verified_version
+          
+        - name: 檢查控制平面組件
+          shell: kubectl get pods -n kube-system --no-headers | grep -E "(kube-apiserver|kube-controller-manager|kube-scheduler)" | grep -v Running | wc -l
+          delegate_to: "{{ groups[target_masters][0] }}"
+          register: unhealthy_pods
+          
+        - name: 顯示配置成功
+          debug:
+            msg: |
+              ✅ {{ inventory_hostname }} Master 配置成功！
+              新版本: {{ verified_version.stdout }}
+              異常 Pod: {{ unhealthy_pods.stdout }}
+              
+        - name: 健康檢查間隔
+          pause:
+            seconds: "{{ safety_settings.health_check_delay }}"
+          when: upgrade_strategy.health_check_between_nodes
+          
+      rescue:
+        - name: Master 配置失敗
+          debug:
+            msg: |
+              ❌ {{ inventory_hostname }} Master 配置失敗
+              
+        - name: 恢復節點調度
+          shell: kubectl uncordon {{ ansible_hostname }}
+          delegate_to: "{{ groups[target_masters][0] }}"
+          ignore_errors: yes
+          
+        - name: 收集失敗資訊
+          shell: |
+            echo "=== Kubelet 狀態 ==="
+            systemctl status kubelet --no-pager -l
+            echo "=== Kubelet 日誌 ==="
+            journalctl -u kubelet --no-pager -l -n 30
+            echo "=== 控制平面 Pod 狀態 ==="
+            kubectl get pods -n kube-system | grep -E "(kube-apiserver|kube-controller-manager|kube-scheduler)"
+          register: failure_info
+          ignore_errors: yes
+          
+        - name: 顯示失敗資訊
+          debug:
+            msg: |
+              📋 失敗診斷資訊:
+              {{ failure_info.stdout }}
+              
+        - name: 還原備份 (如果存在)
+          block:
+            - name: 還原 K8s 配置
+              copy:
+                src: "{{ backup.path }}/{{ item | basename }}"
+                dest: "{{ item }}"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/admin.conf
+                - /etc/kubernetes/controller-manager.conf
+                - /etc/kubernetes/scheduler.conf
+              ignore_errors: yes
+              
+            - name: 重啟 kubelet
+              systemd:
+                name: kubelet
+                state: restarted
+              ignore_errors: yes
+              
+          when: backup.enabled
+          
+        - fail:
+            msg: "Master 配置失敗，請檢查錯誤資訊並手動修復"
+            
+    # Master 間的暫停確認
+    - name: Master 配置間隔確認
+      pause:
+        prompt: |
+          
+          ✅ {{ inventory_hostname }} Master 配置完成
+          
+          請檢查以下狀態:
+          1. kubectl get nodes
+          2. kubectl get pods -n kube-system
+          3. kubectl cluster-info
+          
+          確認無誤後按 Enter 繼續下一個 Master，或 Ctrl+C 停止
+      when: inventory_hostname != groups[target_masters][-1]
+
+# 所有 Masters 配置完成後的驗證
+- name: "Master 配置完成驗證"
+  hosts: "{{ target_masters | default('all_masters') }}[0]"
+  become: yes
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    version_info: "{{ k8s_versions.supported[target_version] }}"
+    
+  tasks:
+    - name: 最終 Masters 驗證
+      block:
+        - name: 檢查所有 Masters 狀態
+          shell: kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers
+          register: masters_status
+          
+        - name: 檢查 Masters 版本
+          shell: kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
+          register: masters_versions
+          
+        - name: 檢查未就緒 Masters
+          shell: kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers | grep -v Ready | wc -l
+          register: unready_masters
+          
+        - name: 檢查控制平面 Pods
+          shell: kubectl get pods -n kube-system --no-headers | grep -E "(kube-apiserver|kube-controller-manager|kube-scheduler|etcd)" | grep -v Running | wc -l
+          register: unhealthy_control_pods
+          
+        - name: 顯示 Masters 配置總結
+          debug:
+            msg: |
+              🏆 所有 Master 節點配置完成！
+              ===========================
+              
+              📊 Masters 狀態:
+              {{ masters_status.stdout }}
+              
+              📋 Masters 版本:
+              {{ masters_versions.stdout }}
+              
+              ✅ 健康檢查:
+              • 未就緒 Masters: {{ unready_masters.stdout }}
+              • 異常控制平面 Pods: {{ unhealthy_control_pods.stdout }}
+              
+              {{ '🎉 所有 Masters 健康，可以繼續配置 Workers' if unready_masters.stdout == '0' and unhealthy_control_pods.stdout == '0' else '⚠️ 有 Masters 問題，請檢查' }}
+              
+              📋 後續步驟:
+              ansible-playbook k8s-worker-configurator.yml -e target_workers={{ target_masters.replace('masters', 'workers') }} -e target_version={{ target_version }}
+              
+        - name: 配置失敗警告
+          fail:
+            msg: |
+              ❌ Master 配置驗證失敗！
+              未就緒 Masters: {{ unready_masters.stdout }}
+              異常控制平面 Pods: {{ unhealthy_control_pods.stdout }}
+              請修復問題後再繼續
+          when: unready_masters.stdout != '0' or unhealthy_control_pods.stdout != '0'

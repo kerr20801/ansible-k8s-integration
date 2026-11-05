@@ -1,0 +1,116 @@
+# K8s 集群統一清單
+# 設計原則：清楚標示環境、角色、規格、位置
+
+# ========================================
+# UAT 環境 (測試環境 - 先行升級)
+# ========================================
+[uat_masters]
+# UAT Control Plane Nodes
+uat-master     ansible_host=10.240.0.71  ansible_user=deployer  ansible_become=yes  # 4C8G - 主要 Master
+
+[uat_workers]  
+# UAT Worker Nodes
+uat-worker1    ansible_host=10.240.0.72  ansible_user=deployer  ansible_become=yes  # 8C16G - 應用節點
+uat-worker2    ansible_host=10.240.0.73  ansible_user=deployer  ansible_become=yes  # 8C16G - 應用節點
+
+# ========================================
+# PROD 環境 (生產環境 - UAT 穩定後升級)  
+# ========================================
+[prod_masters]
+# PROD Control Plane Nodes (HA Setup)
+prod-master1   ansible_host=10.240.0.81  ansible_user=deployer  ansible_become=yes  # 8C16G - 主要 Master
+prod-master2   ansible_host=10.240.0.82  ansible_user=deployer  ansible_become=yes  # 8C16G - 備用 Master  
+prod-master3   ansible_host=10.240.0.83  ansible_user=deployer  ansible_become=yes  # 8C16G - 備用 Master
+
+[prod_workers]
+# PROD Worker Nodes (High Performance)
+prod-worker1   ansible_host=10.240.0.84  ansible_user=deployer  ansible_become=yes  # 16C32G - 重要應用
+prod-worker2   ansible_host=10.240.0.85  ansible_user=deployer  ansible_become=yes  # 16C32G - 重要應用
+prod-worker3   ansible_host=10.240.0.86  ansible_user=deployer  ansible_become=yes  # 16C32G - 重要應用
+
+# ========================================
+# 環境群組定義
+# ========================================
+[uat:children]
+uat_masters
+uat_workers
+
+[prod:children]  
+prod_masters
+prod_workers
+
+# ========================================
+# 角色群組定義 (跨環境操作)
+# ========================================
+[all_masters:children]
+uat_masters
+prod_masters
+
+[all_workers:children]
+uat_workers  
+prod_workers
+
+# ========================================
+# 地理位置群組 (如果有多機房)
+# ========================================
+# [datacenter_a]
+# uat-master1 uat-worker1 prod-master1 prod-worker1
+
+# [datacenter_b]  
+# uat-master2 uat-worker2 prod-master2 prod-worker2
+
+# ========================================
+# 功能群組 (特殊用途節點)
+# ========================================
+# [gpu_nodes]
+# prod-worker3  # 有 GPU 的節點
+
+# [storage_nodes]
+# prod-worker1 prod-worker2  # 存儲密集節點
+
+# ========================================
+# 全域變數設定
+# ========================================
+[all:vars]
+# SSH 連接設定
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_pipelining=true
+
+# 環境標識
+inventory_version='2025-07-03'
+cluster_type='hybrid'  # uat + prod
+
+# 網路設定
+cluster_cidr='10.244.0.0/16'
+service_cidr='10.96.0.0/12'
+
+# ========================================
+# 環境特定變數
+# ========================================
+[uat:vars]
+environment='uat'
+cluster_name='uat-k8s'
+api_vip='10.240.0.10'
+upgrade_priority=1  # 先升級
+maintenance_window='週末 2:00-6:00'
+
+[prod:vars]
+environment='prod'  
+cluster_name='prod-k8s'
+api_vip='10.240.0.20'
+upgrade_priority=2  # 後升級
+maintenance_window='週日 1:00-3:00'
+
+# ========================================
+# 角色特定變數
+# ========================================
+[all_masters:vars]
+node_role='control-plane'
+backup_enabled=true
+monitoring_enabled=true
+
+[all_workers:vars]  
+node_role='worker'
+log_level='info'
+max_pods=110

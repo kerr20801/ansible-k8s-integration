@@ -1,0 +1,157 @@
+---
+# ================================
+# 主升級劇本 - 完整流程
+# 整合分階段升級邏輯
+# ================================
+
+- name: "企業級 Kubernetes 集群升級"
+  hosts: localhost
+  gather_facts: no
+  
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    environment: "{{ environment | default('production') }}"
+    cluster_name: "{{ cluster_name | default('k8s-cluster') }}"
+    
+  tasks:
+    - name: Display upgrade plan
+      debug:
+        msg: |
+          ===============================================
+          Kubernetes 集群升級計劃
+          ===============================================
+          
+          升級目標:
+          - 環境: {{ environment }}
+          - 目標版本: {{ target_version }}
+          - 升級策略: {{ '分段升級' if upgrade_strategy.staged_upgrade else '直接升級' }}
+          
+          升級流程:
+          1. 升級前檢查 (約 2-5 分鐘)
+          2. Master 節點升級 (約 10-20 分鐘)
+          3. Worker 節點升級 (約 15-30 分鐘)  
+          4. 升級後驗證 (約 3-5 分鐘)
+          
+          預估總時間: 30-60 分鐘
+          
+          注意事項:
+          - 升級期間會有短暫的 Pod 重新調度
+          - 建議在維護時間窗口執行
+          - 請確保已通知相關團隊
+          
+    - name: Confirm upgrade execution
+      pause:
+        prompt: |
+          
+          確認要執行 {{ environment }} 環境的 K8S 升級嗎？
+          
+          這將把集群從當前版本升級到 {{ target_version }}
+          
+          輸入 'yes' 確認，或 Ctrl+C 取消
+      register: confirmation
+      
+    - name: Validate confirmation
+      fail:
+        msg: "升級已取消"
+      when: confirmation.user_input | lower != 'yes'
+
+# ================================
+# 階段 1: 升級前檢查
+# ================================
+
+- import_playbook: 01-pre-upgrade-check.yml
+  vars:
+    target_version: "{{ target_version }}"
+    environment: "{{ environment }}"
+
+- name: "Pre-upgrade checkpoint"
+  hosts: localhost
+  tasks:
+    - name: Checkpoint 1 passed
+      debug:
+        msg: |
+          ✓ 階段 1 完成: 升級前檢查通過
+          
+          繼續升級 Master 節點...
+
+# ================================
+# 階段 2: Master 升級
+# ================================
+
+- import_playbook: 02-upgrade-masters.yml
+  vars:
+    target_version: "{{ target_version }}"
+    environment: "{{ environment }}"
+
+- name: "Masters upgrade checkpoint"
+  hosts: localhost
+  tasks:
+    - name: Checkpoint 2 passed
+      debug:
+        msg: |
+          ✓ 階段 2 完成: Master 節點升級完成
+          
+          繼續升級 Worker 節點...
+
+# ================================
+# 階段 3: Worker 升級
+# ================================
+
+- import_playbook: 03-upgrade-workers.yml
+  vars:
+    target_version: "{{ target_version }}"
+    environment: "{{ environment }}"
+
+- name: "Workers upgrade checkpoint"
+  hosts: localhost
+  tasks:
+    - name: Checkpoint 3 passed
+      debug:
+        msg: |
+          ✓ 階段 3 完成: Worker 節點升級完成
+          
+          執行最終驗證...
+
+# ================================
+# 階段 4: 升級後驗證
+# ================================
+
+- import_playbook: 04-post-upgrade-verify.yml
+  vars:
+    target_version: "{{ target_version }}"
+    environment: "{{ environment }}"
+
+# ================================
+# 最終總結
+# ================================
+
+- name: "Upgrade completion summary"
+  hosts: localhost
+  tasks:
+    - name: Final upgrade summary
+      debug:
+        msg: |
+          
+          ===============================================
+          Kubernetes 集群升級完成！
+          ===============================================
+          
+          升級成功:
+          - 環境: {{ environment }}
+          - 新版本: {{ target_version }}
+          - 完成時間: {{ ansible_date_time.iso8601 }}
+          
+          已完成階段:
+          ✓ 1. 升級前檢查
+          ✓ 2. Master 節點升級
+          ✓ 3. Worker 節點升級
+          ✓ 4. 升級後驗證
+          
+          後續工作:
+          - 持續監控集群穩定性
+          - 更新變更記錄
+          - 通知相關團隊
+          
+          如有問題請聯繫基礎設施團隊
+          
+          感謝使用企業級 K8S 升級自動化解決方案！

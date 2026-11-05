@@ -1,0 +1,342 @@
+---
+# K8s 組件管理器 - 負責安裝和升級 K8s 組件
+# 使用方式：
+#   ansible-playbook -i inventory/all k8s-component-manager.yml -e target_nodes=uat_masters -e target_version=1.32.6
+#   ansible-playbook -i inventory/all k8s-component-manager.yml -e target_nodes=prod_workers -e target_version=1.33.2
+
+- name: "K8s 組件管理 - {{ operation_type | default('upgrade') | title }}"
+  hosts: "{{ target_nodes | default('all') }}"
+  become: yes
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    operation_type: "{{ operation | default('upgrade') }}"  # install 或 upgrade
+    version_info: "{{ k8s_upgrade_paths.versions[target_version] }}"
+    repo_version: "{{ version_info.repo_version }}"
+    
+  pre_tasks:
+    - name: 驗證參數
+      assert:
+        that:
+          - target_version is defined
+          - target_version in k8s_upgrade_paths.versions
+          - target_nodes is defined
+        fail_msg: |
+          參數錯誤！
+          支援的版本: {{ k8s_upgrade_paths.versions.keys() | list }}
+          請指定 target_nodes 和 target_version
+          
+    - name: 檢查升級路徑 (第一個節點檢查即可)
+      block:
+        - name: 檢查當前集群版本
+          shell: kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/[Kv]//g' || echo "not_installed"
+          register: current_cluster_version
+          delegate_to: "{{ groups[target_nodes.split(',')[0] if ',' in target_nodes else target_nodes][0] }}"
+          ignore_errors: yes
+          
+        - name: 智能升級路徑分析
+          set_fact:
+            current_version: "{{ current_cluster_version.stdout }}"
+            upgrade_paths: "{{ k8s_upgrade_paths.upgrade_matrix[current_cluster_version.stdout] | default({'direct': [], 'staged': []}) }}"
+            is_direct_upgrade: "{{ target_version in (k8s_upgrade_paths.upgrade_matrix[current_cluster_version.stdout].direct | default([])) }}"
+            is_staged_upgrade: "{{ target_version in (k8s_upgrade_paths.upgrade_matrix[current_cluster_version.stdout].staged | default([])) }}"
+            is_new_install: "{{ current_cluster_version.stdout in ['not_installed', 'kubectl_available_but_no_cluster', 'kubelet_available_but_error'] }}"
+            
+        - name: 顯示升級路徑分析
+          debug:
+            msg: |
+              🔍 升級路徑分析
+              ================
+              當前版本: {{ current_version }}
+              目標版本: {{ target_version }}
+              
+              {% if is_new_install %}
+              🆕 檢測到全新安裝，將直接安裝 {{ target_version }}
+              {% else %}
+              📋 可用升級路徑:
+              • 直接升級: {{ upgrade_paths.direct | default([]) | join(', ') or '無' }}
+              • 分段升級: {{ upgrade_paths.staged | default([]) | join(' → ') or '無' }}
+              
+              ✅ 升級策略: {{ '直接升級' if is_direct_upgrade else ('分段升級' if is_staged_upgrade else '不支援') }}
+              {% endif %}
+              
+        - name: 升級路徑驗證
+          assert:
+            that:
+              - is_direct_upgrade or is_staged_upgrade or is_new_install
+            fail_msg: |
+              ❌ 不支援的升級路徑！
+              從 {{ current_version }} 升級到 {{ target_version }}
+              
+              💡 建議的升級路徑:
+              {% if upgrade_paths.direct %}
+              直接升級到: {{ upgrade_paths.direct | join(', ') }}
+              {% endif %}
+              {% if upgrade_paths.staged %}
+              分段升級: {{ upgrade_paths.staged | join(' → ') }}
+              {% endif %}
+              
+        - name: 分段升級警告
+          debug:
+            msg: |
+              ⚠️ 分段升級建議
+              ================
+              當前要升級: {{ current_version }} → {{ target_version }}
+              
+              建議分段升級路徑: {{ upgrade_paths.staged | join(' → ') }}
+              
+              如果要一次升級到 {{ target_version }}，建議先升級到中間版本測試穩定性。
+          when: 
+            - not is_direct_upgrade
+            - is_staged_upgrade
+            
+      when: inventory_hostname == groups[target_nodes.split(',')[0] if ',' in target_nodes else target_nodes][0]
+      run_once: true
+          
+    - name: 顯示操作資訊
+      debug:
+        msg: |
+          🔧 K8s 組件{{ operation_type | title }}
+          ================================
+          目標節點: {{ target_nodes }}
+          目標版本: {{ target_version }} ({{ version_info.description }})
+          儲存庫版本: {{ repo_version }}
+          支援到期: {{ version_info.support_until }}
+          
+  tasks:
+    - name: 檢查當前安裝狀態
+      block:
+        - name: 檢查 kubeadm 是否已安裝
+          shell: kubeadm version --output=short 2>/dev/null || echo "not_installed"
+          register: kubeadm_current
+          
+        - name: 檢查 kubelet 是否已安裝  
+          shell: kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/v//' || echo "not_installed"
+          register: kubelet_current
+          
+        - name: 檢查 kubectl 是否已安裝
+          shell: kubectl version --client --output=yaml 2>/dev/null | grep gitVersion | awk '{print $2}' | sed 's/v//' || echo "not_installed"
+          register: kubectl_current
+          
+        - name: 顯示當前狀態
+          debug:
+            msg: |
+              📊 當前狀態 - {{ inventory_hostname }}:
+              kubeadm: {{ kubeadm_current.stdout }}
+              kubelet: {{ kubelet_current.stdout }}
+              kubectl: {{ kubectl_current.stdout }}
+              
+        - name: 判斷操作類型
+          set_fact:
+            actual_operation: "{{ 'install' if kubelet_current.stdout == 'not_installed' else operation_type }}"
+            
+    - name: 跳過已升級節點
+      meta: end_host
+      when: 
+        - actual_operation == "upgrade"
+        - kubelet_current.stdout == target_version
+        
+    - name: 執行組件管理
+      block:
+        - name: 備份現有配置 (僅升級時)
+          block:
+            - name: 建立備份目錄
+              file:
+                path: "{{ backup.path }}"
+                state: directory
+                
+            - name: 備份 kubelet 配置
+              copy:
+                src: "{{ item }}"
+                dest: "{{ backup.path }}/"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/kubelet.conf
+                - /var/lib/kubelet/config.yaml
+              ignore_errors: yes
+              
+          when: 
+            - actual_operation == "upgrade"
+            - backup.enabled
+            
+        - name: 更新系統套件
+          apt:
+            update_cache: yes
+            
+        - name: 安裝必要套件
+          apt:
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gpg
+            state: present
+            
+        - name: 建立 keyrings 目錄
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+            
+        - name: 下載 K8s GPG 金鑰
+          shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ repo_version }}/deb/Release.key | 
+            sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.asc > /dev/null
+          args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            
+        - name: 添加 K8s APT 儲存庫
+          shell: |
+            echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ repo_version }}/deb/ /' | 
+            sudo tee /etc/apt/sources.list.d/kubernetes.list
+          register: apt_repo_result
+          
+        - name: 驗證 APT 儲存庫配置
+          shell: cat /etc/apt/sources.list.d/kubernetes.list | grep "v{{ repo_version }}"
+          register: apt_repo_verify
+          failed_when: apt_repo_verify.rc != 0
+          
+        - name: 強制更新 APT 源 (重試機制)
+          shell: apt update
+          register: apt_update_result
+          until: apt_update_result.rc == 0
+          retries: 3
+          delay: 10
+            
+        - name: 更新套件索引
+          apt:
+            update_cache: yes
+            
+        - name: 解鎖 K8s 套件 (僅升級時)
+          shell: apt-mark unhold kubeadm kubelet kubectl
+          when: actual_operation == "upgrade"
+          
+        - name: "{{ actual_operation | title }} K8s 組件"
+          apt:
+            name:
+              - "kubeadm={{ target_version }}-1.1"
+              - "kubelet={{ target_version }}-1.1" 
+              - "kubectl={{ target_version }}-1.1"
+            state: present
+            force: "{{ packages.force_update }}"
+            
+        - name: 鎖定 K8s 套件版本
+          shell: apt-mark hold kubeadm kubelet kubectl
+          when: packages.hold_packages
+          
+        - name: 重啟 kubelet 服務
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+            enabled: yes
+            
+        - name: 等待 kubelet 啟動
+          wait_for:
+            port: 10250
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 60
+            
+        - name: 驗證安裝結果
+          block:
+            - name: 檢查 kubeadm 版本
+              shell: kubeadm version --output=short
+              register: kubeadm_verify
+              
+            - name: 檢查 kubelet 版本
+              shell: kubelet --version | awk '{print $2}'
+              register: kubelet_verify
+              
+            - name: 檢查 kubectl 版本  
+              shell: kubectl version --client --output=yaml | grep gitVersion | awk '{print $2}'
+              register: kubectl_verify
+              
+            - name: 顯示安裝結果
+              debug:
+                msg: |
+                  ✅ {{ inventory_hostname }} 組件{{ actual_operation }}成功！
+                  kubeadm: {{ kubeadm_verify.stdout }}
+                  kubelet: {{ kubelet_verify.stdout }}
+                  kubectl: {{ kubectl_verify.stdout }}
+                  
+            - name: 驗證版本正確性
+              assert:
+                that:
+                  - target_version in kubeadm_verify.stdout
+                  - target_version in kubelet_verify.stdout  
+                  - target_version in kubectl_verify.stdout
+                fail_msg: "版本驗證失敗，目標版本 {{ target_version }} 與實際安裝版本不符"
+                
+      rescue:
+        - name: 組件管理失敗
+          debug:
+            msg: |
+              ❌ {{ inventory_hostname }} 組件{{ actual_operation }}失敗
+              
+        - name: 收集錯誤資訊
+          shell: |
+            echo "=== APT 狀態 ==="
+            apt list --installed | grep -E "(kubeadm|kubelet|kubectl)"
+            echo "=== Kubelet 狀態 ==="
+            systemctl status kubelet --no-pager -l
+            echo "=== Kubelet 日誌 ==="
+            journalctl -u kubelet --no-pager -l -n 20
+          register: error_info
+          ignore_errors: yes
+          
+        - name: 顯示錯誤資訊
+          debug:
+            msg: |
+              📋 錯誤診斷資訊:
+              {{ error_info.stdout }}
+              
+        - name: 還原備份 (如果存在)
+          block:
+            - name: 還原 kubelet 配置
+              copy:
+                src: "{{ backup.path }}/{{ item | basename }}"
+                dest: "{{ item }}"
+                remote_src: yes
+              loop:
+                - /etc/kubernetes/kubelet.conf
+                - /var/lib/kubelet/config.yaml
+              ignore_errors: yes
+              
+            - name: 重啟 kubelet
+              systemd:
+                name: kubelet
+                state: restarted
+              ignore_errors: yes
+              
+          when: 
+            - actual_operation == "upgrade"
+            - backup.enabled
+            
+        - fail:
+            msg: "K8s 組件{{ actual_operation }}失敗，請檢查錯誤資訊"
+
+# 最終狀態報告
+- name: "組件管理完成報告"
+  hosts: localhost
+  gather_facts: no
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    version_info: "{{ k8s_versions.supported[target_version] }}"
+    
+  tasks:
+    - name: 顯示完成報告
+      debug:
+        msg: |
+          🎉 K8s 組件管理完成！
+          ========================
+          
+          📊 目標資訊:
+          • 節點群組: {{ target_nodes }}
+          • 目標版本: {{ target_version }} ({{ version_info.description }})
+          • 操作類型: {{ operation | default('upgrade') | title }}
+          
+          📋 後續步驟:
+          1. 如果是 Masters，執行: ansible-playbook k8s-master-configurator.yml
+          2. 如果是 Workers，執行: ansible-playbook k8s-worker-configurator.yml
+          3. 驗證集群狀態: kubectl get nodes
+          
+          ⚠️ 注意: 組件升級完成後，還需要執行角色配置才能完成整個升級流程

@@ -1,0 +1,194 @@
+---
+# ================================
+# 升級前全面檢查劇本
+# 確保集群健康且符合升級條件
+# ================================
+
+- name: "Pre-Upgrade Health Check"
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    cluster_name: "{{ cluster_name | default('k8s-cluster') }}"
+    environment: "{{ environment | default('production') }}"
+    
+  tasks:
+    - name: Display upgrade information
+      debug:
+        msg: |
+          開始升級前檢查
+          目標環境: {{ environment }}
+          目標版本: {{ target_version }}
+          集群名稱: {{ cluster_name }}
+          
+    - name: Check if running as root or with sudo
+      fail:
+        msg: "此劇本需要管理員權限執行"
+      when: ansible_user_uid != 0 and ansible_become != true
+      
+    - name: Get current K8S version
+      shell: kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/v//' || echo "not-installed"
+      register: current_k8s_version
+      ignore_errors: yes
+
+    - name: Parse version numbers
+      set_fact:
+        current_version_clean: "{{ current_k8s_version.stdout | regex_replace('v?([0-9]+\\.[0-9]+\\.[0-9]+).*', '\\1') }}"
+        target_version_clean: "{{ target_version | regex_replace('v?([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') }}"
+      when: current_k8s_version.stdout != "not-installed"
+
+    - name: Check version conditions
+      block:
+        - name: Check if already target version
+          fail:
+            msg: "節點已經是目標版本 {{ target_version_clean }}，無需升級"
+          when: current_version_clean == target_version_clean
+
+        - name: Check for downgrade attempt
+          fail:
+            msg: "目標版本 {{ target_version_clean }} 低於當前版本 {{ current_version_clean }}，不允許降級"
+          when: 
+            - current_version_clean is version(target_version_clean, '>')
+            - not (upgrade_strategy.allow_downgrade | default(false))
+
+        - name: Cross-version upgrade warning
+          debug:
+            msg: |
+              跨版本升級檢測：
+              當前版本: {{ current_version_clean }}
+              目標版本: {{ target_version_clean }}
+              
+              這是跨 minor 版本升級，風險較高
+          when: 
+            - current_version_clean.split('.')[1] | int != target_version_clean.split('.')[1] | int
+      when: current_k8s_version.stdout != "not-installed"
+      
+    - name: Check if nodes are ready (delegate to first master)
+      shell: kubectl get nodes {{ ansible_hostname }} --no-headers | awk '{print $2}' 2>/dev/null || echo "Unknown"
+      register: node_status
+      ignore_errors: yes
+      delegate_to: "{{ groups['masters'][0] }}"
+      
+    - name: Verify disk space
+      shell: df -h / | tail -1 | awk '{print $5}' | sed 's/%//'
+      register: disk_usage
+      
+    - name: Verify memory
+      shell: free -m | grep Mem | awk '{print int($3/$2*100)}'
+      register: memory_usage
+      
+    - name: Check system load
+      shell: uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | sed 's/,//'
+      register: system_load
+      
+    - name: Check critical services
+      systemd:
+        name: "{{ item }}"
+        state: started
+      register: service_check
+      ignore_errors: yes
+      loop:
+        - kubelet
+        - containerd
+        - ssh
+        
+    - name: Display system status
+      debug:
+        msg: |
+          {{ ansible_hostname }} 系統狀態:
+          當前 K8S 版本: {{ current_version_clean | default(current_k8s_version.stdout) }}
+          目標版本: {{ target_version_clean }}
+          節點狀態: {{ node_status.stdout }}
+          磁碟使用率: {{ disk_usage.stdout }}%
+          記憶體使用率: {{ memory_usage.stdout }}%
+          系統負載: {{ system_load.stdout }}
+          
+    - name: Fail if disk usage too high
+      fail:
+        msg: "磁碟使用率過高 ({{ disk_usage.stdout }}%), 請清理後再升級"
+      when: disk_usage.stdout | int > 85
+      
+    - name: Fail if memory usage too high  
+      fail:
+        msg: "記憶體使用率過高 ({{ memory_usage.stdout }}%), 請檢查後再升級"
+      when: memory_usage.stdout | int > 90
+      
+    - name: Warning for high system load
+      debug:
+        msg: "系統負載較高 ({{ system_load.stdout }}), 建議降低負載後再升級"
+      when: system_load.stdout | float > 2.0
+
+- name: "Cluster-wide Pre-upgrade Checks"
+  hosts: masters[0]
+  become: yes
+  
+  tasks:
+    - name: Check cluster health
+      shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+      register: unhealthy_nodes
+      
+    - name: Check running pods
+      shell: kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers | wc -l
+      register: problematic_pods
+      
+    - name: Check etcd health
+      shell: kubectl get componentstatuses --no-headers 2>/dev/null | grep -v Healthy | wc -l || echo "0"
+      register: etcd_issues
+      ignore_errors: yes
+      
+    - name: Display cluster health
+      debug:
+        msg: |
+          集群健康狀態:
+          異常節點數: {{ unhealthy_nodes.stdout }}
+          問題 Pod 數: {{ problematic_pods.stdout }}
+          etcd 問題數: {{ etcd_issues.stdout }}
+          
+    - name: Fail if cluster not healthy
+      fail:
+        msg: "集群存在問題，請修復後再升級"
+      when: 
+        - unhealthy_nodes.stdout | int > 0 or problematic_pods.stdout | int > 0
+        
+    - name: Create backup directory
+      file:
+        path: "{{ safety_settings.backup_path }}"
+        state: directory
+        mode: '0755'
+      when: safety_settings.backup_before_upgrade
+      
+    - name: Backup etcd (if on first master)
+      shell: |
+        ETCDCTL_API=3 etcdctl snapshot save {{ safety_settings.backup_path }}/etcd-snapshot-{{ ansible_date_time.epoch }}.db \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key
+      when: 
+        - safety_settings.backup_before_upgrade
+        - inventory_hostname == groups['masters'][0]
+      ignore_errors: yes
+      
+    - name: Backup kubeadm config
+      shell: kubectl -n kube-system get cm kubeadm-config -o yaml > {{ safety_settings.backup_path }}/kubeadm-config-backup.yaml
+      when: safety_settings.backup_before_upgrade
+      ignore_errors: yes
+      
+    - name: Pre-upgrade check summary
+      debug:
+        msg: |
+          升級前檢查完成！
+          
+          檢查結果:
+          - 所有節點健康: OK
+          - 集群服務正常: OK
+          - 磁碟空間充足: OK
+          - 系統資源正常: OK
+          - 備份已建立: {{ 'OK' if safety_settings.backup_before_upgrade else '跳過' }}
+          
+          準備開始升級到 {{ target_version }}
+          
+          下一步執行:
+          ansible-playbook -i inventory/hosts.yml playbooks/02-upgrade-masters.yml -e target_version={{ target_version }}

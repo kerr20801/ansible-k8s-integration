@@ -1,0 +1,354 @@
+---
+# ================================
+# 升級後全面驗證劇本
+# 確保升級成功且系統正常運行
+# ================================
+
+- name: "Post-Upgrade Comprehensive Verification"
+  hosts: masters[0]
+  become: yes
+  
+  vars:
+    target_version: "{{ target_version | default(default_target_version) }}"
+    environment: "{{ environment | default('production') }}"
+    cluster_name: "{{ cluster_name | default('k8s-cluster') }}"
+    
+  tasks:
+    - name: Display verification start
+      debug:
+        msg: |
+          開始升級後全面驗證
+          目標版本: {{ target_version }}
+          集群: {{ cluster_name }}
+          環境: {{ environment }}
+          
+    # ================================
+    # 集群基本狀態檢查
+    # ================================
+    
+    - name: Get all nodes status
+      shell: kubectl get nodes -o wide
+      register: all_nodes_status
+      
+    - name: Get cluster info
+      shell: kubectl cluster-info
+      register: cluster_info
+      
+    - name: Check kubectl version
+      shell: kubectl version --short 2>/dev/null || kubectl version
+      register: kubectl_version
+      ignore_errors: yes
+      
+    - name: Verify all nodes are target version
+      shell: kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' | grep -v {{ target_version }} | wc -l
+      register: nodes_wrong_version
+      
+    - name: Count ready nodes
+      shell: kubectl get nodes --no-headers | grep Ready | wc -l
+      register: ready_nodes_count
+      
+    - name: Count total nodes
+      shell: kubectl get nodes --no-headers | wc -l
+      register: total_nodes_count
+      
+    # ================================
+    # Pod 狀態檢查
+    # ================================
+    
+    - name: Check all pods status
+      shell: kubectl get pods --all-namespaces
+      register: all_pods_status
+      
+    - name: Count running pods
+      shell: kubectl get pods --all-namespaces --no-headers --field-selector=status.phase=Running | wc -l
+      register: running_pods_count
+      
+    - name: Count total pods
+      shell: kubectl get pods --all-namespaces --no-headers | wc -l
+      register: total_pods_count
+      
+    - name: Find problematic pods
+      shell: kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers
+      register: problematic_pods_list
+      ignore_errors: yes
+      
+    # ================================
+    # 系統組件檢查
+    # ================================
+    
+    - name: Check system pods
+      shell: kubectl get pods -n kube-system --no-headers | grep -v Running | wc -l
+      register: system_pods_issues
+      
+    - name: Check etcd status
+      shell: kubectl get pods -n kube-system | grep etcd
+      register: etcd_status
+      
+    - name: Check API server status
+      shell: kubectl get pods -n kube-system | grep apiserver
+      register: apiserver_status
+      
+    - name: Check DNS status
+      shell: kubectl get pods -n kube-system | grep -E "coredns|kube-dns"
+      register: dns_status
+      
+    # ================================
+    # 網路檢查
+    # ================================
+    
+    - name: Check CNI pods (Calico/Flannel)
+      shell: kubectl get pods -n kube-system | grep -E "calico|flannel" || echo "CNI pods not found"
+      register: cni_status
+      ignore_errors: yes
+      
+    - name: Test DNS resolution
+      shell: kubectl run dns-test --image=busybox --rm -it --restart=Never -- nslookup kubernetes.default.svc.cluster.local
+      register: dns_test
+      ignore_errors: yes
+      timeout: 30
+      
+    # ================================
+    # 資源檢查
+    # ================================
+    
+    - name: Check node resources
+      shell: kubectl top nodes --no-headers 2>/dev/null || echo "metrics-server not available"
+      register: node_resources
+      ignore_errors: yes
+      
+    - name: Check persistent volumes
+      shell: kubectl get pv --no-headers | wc -l
+      register: pv_count
+      ignore_errors: yes
+      
+    - name: Check services
+      shell: kubectl get svc --all-namespaces --no-headers | wc -l
+      register: services_count
+      
+    # ================================
+    # 應用程式檢查
+    # ================================
+    
+    - name: Check custom namespaces
+      shell: kubectl get namespaces --no-headers | grep -v -E "default|kube-system|kube-public|kube-node-lease" | awk '{print $1}'
+      register: custom_namespaces
+      
+    - name: Check deployments status
+      shell: |
+        for ns in $(kubectl get namespaces -o name | cut -d/ -f2); do
+          echo "=== Namespace: $ns ==="
+          kubectl get deployments -n $ns --no-headers 2>/dev/null | awk '{print $1"\t"$2"/"$3"\t"$4"\t"$5}' || echo "No deployments"
+        done
+      register: deployments_status
+      
+    # ================================
+    # 事件檢查
+    # ================================
+    
+    - name: Check recent events
+      shell: kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -20
+      register: recent_events
+      
+    - name: Check warning events
+      shell: kubectl get events --all-namespaces --field-selector type=Warning --sort-by='.lastTimestamp' | tail -10
+      register: warning_events
+      ignore_errors: yes
+      
+    # ================================
+    # 生成驗證報告
+    # ================================
+    
+    - name: Generate verification report
+      debug:
+        msg: |
+          
+          ===============================================
+          K8S 集群升級驗證報告
+          ===============================================
+          
+          基本資訊:
+          - 集群名稱: {{ cluster_name }}
+          - 環境: {{ environment }}
+          - 目標版本: {{ target_version }}
+          - 驗證時間: {{ ansible_date_time.iso8601 }}
+          
+          版本資訊:
+          {{ kubectl_version.stdout }}
+          
+          節點狀態:
+          - 總節點數: {{ total_nodes_count.stdout }}
+          - 就緒節點數: {{ ready_nodes_count.stdout }}
+          - 版本不符節點: {{ nodes_wrong_version.stdout }}
+          {{ '✓ 所有節點版本正確' if nodes_wrong_version.stdout == '0' else '✗ 有節點版本不符' }}
+          
+          Pod 狀態:
+          - 總 Pod 數: {{ total_pods_count.stdout }}
+          - 運行中 Pod: {{ running_pods_count.stdout }}
+          - 系統 Pod 問題: {{ system_pods_issues.stdout }}
+          {{ '✓ 所有 Pod 正常運行' if problematic_pods_list.stdout == '' else '✗ 有 Pod 問題' }}
+          
+          系統組件:
+          - etcd: {{ '✓ 正常' if 'Running' in etcd_status.stdout else '✗ 異常' }}
+          - API Server: {{ '✓ 正常' if 'Running' in apiserver_status.stdout else '✗ 異常' }}
+          - DNS: {{ '✓ 正常' if 'Running' in dns_status.stdout else '✗ 異常' }}
+          - CNI: {{ '✓ 正常' if 'Running' in cni_status.stdout else '⚠ 檢查' }}
+          
+          網路驗證:
+          {{ '✓ DNS 解析正常' if dns_test.rc == 0 else '✗ DNS 解析失敗' }}
+          
+          資源狀況:
+          - PV 數量: {{ pv_count.stdout }}
+          - 服務數量: {{ services_count.stdout }}
+          - 自定義命名空間: {{ custom_namespaces.stdout_lines | length }}
+          
+    - name: Display detailed node status
+      debug:
+        msg: |
+          詳細節點狀態:
+          {{ all_nodes_status.stdout }}
+          
+    - name: Display problematic pods if any
+      debug:
+        msg: |
+          問題 Pods:
+          {{ problematic_pods_list.stdout }}
+      when: problematic_pods_list.stdout != ""
+      
+    - name: Display deployments status
+      debug:
+        msg: |
+          部署狀態:
+          {{ deployments_status.stdout }}
+          
+    - name: Display recent warning events
+      debug:
+        msg: |
+          最近警告事件:
+          {{ warning_events.stdout }}
+      when: warning_events.stdout != ""
+      
+    # ================================
+    # 最終狀態判斷
+    # ================================
+    
+    - name: Calculate upgrade success score
+      set_fact:
+        success_score: |
+          {%- set score = 0 -%}
+          {%- if nodes_wrong_version.stdout == '0' -%}
+            {%- set score = score + 25 -%}
+          {%- endif -%}
+          {%- if ready_nodes_count.stdout == total_nodes_count.stdout -%}
+            {%- set score = score + 25 -%}
+          {%- endif -%}
+          {%- if problematic_pods_list.stdout == '' -%}
+            {%- set score = score + 25 -%}
+          {%- endif -%}
+          {%- if system_pods_issues.stdout == '0' -%}
+            {%- set score = score + 25 -%}
+          {%- endif -%}
+          {{ score }}
+          
+    - name: Display final upgrade status
+      debug:
+        msg: |
+          
+          ===============================================
+          升級完成度評分: {{ success_score }}/100
+          ===============================================
+          
+          {% if success_score | int == 100 %}
+          🎉 完美升級! 集群完全健康
+          
+          檢查清單:
+          ✓ 所有節點版本正確 ({{ target_version }})
+          ✓ 所有節點就緒 ({{ ready_nodes_count.stdout }}/{{ total_nodes_count.stdout }})
+          ✓ 所有 Pod 正常運行
+          ✓ 系統組件健康
+          
+          🚀 集群已成功升級到 Kubernetes {{ target_version }}
+          {% elif success_score | int >= 75 %}
+          ✓ 升級成功! 有輕微問題需要關注
+          
+          建議檢查:
+          - 未就緒節點或 Pod
+          - 系統組件狀態
+          {% elif success_score | int >= 50 %}
+          ⚠ 升級部分成功，需要修復問題
+          
+          需要檢查:
+          - 節點版本和狀態
+          - Pod 調度問題
+          - 系統組件故障
+          {% else %}
+          ✗ 升級失敗，需要緊急處理
+          
+          緊急檢查:
+          - 集群基本功能
+          - 關鍵系統組件
+          - 可能需要回滾
+          {% endif %}
+          
+          如需支援請聯繫基礎設施團隊
+          附帶本驗證報告
+          
+    # ================================
+    # 建立升級記錄
+    # ================================
+    
+    - name: Create upgrade record
+      copy:
+        content: |
+          # Kubernetes 升級記錄
+          
+          ## 基本資訊
+          - 升級時間: {{ ansible_date_time.iso8601 }}
+          - 環境: {{ environment }}
+          - 集群: {{ cluster_name }}
+          - 目標版本: {{ target_version }}
+          - 執行者: {{ ansible_user }}
+          
+          ## 升級結果
+          - 成功分數: {{ success_score }}/100
+          - 總節點: {{ total_nodes_count.stdout }}
+          - 就緒節點: {{ ready_nodes_count.stdout }}
+          - 運行 Pod: {{ running_pods_count.stdout }}/{{ total_pods_count.stdout }}
+          
+          ## 詳細狀態
+          ### 節點狀態
+          ```
+          {{ all_nodes_status.stdout }}
+          ```
+          
+          ### 系統組件
+          - etcd: {{ etcd_status.stdout }}
+          - API Server: {{ apiserver_status.stdout }}
+          - DNS: {{ dns_status.stdout }}
+          
+          {% if problematic_pods_list.stdout != "" %}
+          ### 問題 Pods
+          ```
+          {{ problematic_pods_list.stdout }}
+          ```
+          {% endif %}
+          
+          ### 部署狀態
+          ```
+          {{ deployments_status.stdout }}
+          ```
+          
+        dest: "/tmp/k8s-upgrade-report-{{ environment }}-{{ ansible_date_time.epoch }}.md"
+        mode: '0644'
+        
+    - name: Final summary
+      debug:
+        msg: |
+          升級報告已保存: /tmp/k8s-upgrade-report-{{ environment }}-{{ ansible_date_time.epoch }}.md
+          
+          下一步建議:
+          1. 保存升級報告供記錄
+          2. 監控集群穩定性 24-48 小時
+          3. 更新運維文檔
+          4. 通知相關團隊升級完成
+          
+          感謝使用企業級 K8S 升級自動化解決方案！

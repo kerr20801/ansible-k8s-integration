@@ -1,0 +1,74 @@
+---
+# ================================
+# Worker 節點設定 Role
+# ================================
+
+- name: Worker 節點設定開始
+  debug:
+    msg: "開始設定 Worker 節點 - {{ inventory_hostname }}"
+
+# ================================
+# 檢查是否已加入集群
+# ================================
+
+- name: 檢查是否已加入集群
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+# ================================
+# 加入 Worker 節點到集群
+# ================================
+
+- name: 加入 Worker 節點到集群
+  command: "{{ hostvars[groups['masters'][0]]['worker_join_command']['stdout'] }}"
+  become: yes
+  when: not kubelet_conf.stat.exists
+
+# ================================
+# 設定節點標籤
+# ================================
+
+- name: 等待節點就緒
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    name: "{{ inventory_hostname }}"
+    kubeconfig: "{{ hostvars[groups['masters'][0]]['ansible_env']['HOME'] }}/.kube/config"
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: 300
+  delegate_to: "{{ groups['masters'][0] }}"
+
+- name: 設定 Worker 節點標籤
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ inventory_hostname }}"
+        labels:
+          node-role.kubernetes.io/worker: ""
+          environment: "{{ environment }}"
+          node-type: worker
+    kubeconfig: "{{ hostvars[groups['masters'][0]]['ansible_env']['HOME'] }}/.kube/config"
+  delegate_to: "{{ groups['masters'][0] }}"
+
+# ================================
+# kubelet 設定調整
+# ================================
+
+- name: 設定 kubelet 額外參數
+  lineinfile:
+    path: /var/lib/kubelet/kubeadm-flags.env
+    regexp: '^KUBELET_KUBEADM_ARGS='
+    line: 'KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --max-pods={{ kubelet_config.max_pods | default(110) }}"'
+  become: yes
+  notify: restart kubelet
+
+- name: Worker 節點設定完成
+  debug:
+    msg: "Worker 節點設定完成並已加入集群 - {{ inventory_hostname }}"
